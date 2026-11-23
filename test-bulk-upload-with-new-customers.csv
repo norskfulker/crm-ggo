@@ -1,0 +1,13 @@
+Customer Email,Amount (INR),Date,UTR,Notes
+john.doe@example.com,10000,01/01/2024,UTR123456789,Sample payment
+newcustomer1@test.com,15000,15/12/2023,UTR987654321,New customer test
+jane.smith@example.com,20000,30/12/2023,UTR456789123,Existing customer
+newcustomer2@example.com,25000,01/01/2024,UTR789123456,Another new customer
+bob.johnson@example.com,30000,15/01/2024,UTR321654987,Existing customer
+newcustomer3@test.com,35000,20/01/2024,UTR147258369,Third new customer
+
+
+
+
+
+

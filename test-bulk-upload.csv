@@ -1,0 +1,6 @@
+Customer Email,Amount (INR),Date,UTR,Notes
+john.doe@example.com,10000,01/01/2024,UTR123456789,Sample payment
+invalid.email@test.com,15000,15/12/2023,UTR987654321,Invalid customer
+jane.smith@example.com,,30/12/2023,UTR456789123,Missing amount
+bob.johnson@example.com,20000,invalid-date,UTR789123456,Invalid date
+alice.wilson@example.com,25000,01/01/2024,,Valid entry

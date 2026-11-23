@@ -1,0 +1,6 @@
+From Bank,To Bank,Amount,Date,UTR,Notes
+HDFC Bank,SBI Bank,50000,15/12/2023,UTR123456,Transfer for business
+ICICI Bank,Axis Bank,25000,16/12/2023,UTR789012,Monthly transfer
+Kotak Bank,Yes Bank,75000,17/12/2023,UTR345678,Investment transfer
+PNB Bank,Canara Bank,30000,18/12/2023,UTR901234,Loan repayment
+Bank of Baroda,Union Bank,45000,19/12/2023,UTR567890,Salary transfer

@@ -1,0 +1,5 @@
+node_modules/
+build/
+.env.local
+# Bank statement exports contain account data - never commit
+bank-data/
