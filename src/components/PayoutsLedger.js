@@ -86,9 +86,11 @@ function AddDepositRow({ onAdd }) {
   );
 }
 
-function PayoutsLedger() {
+// embedded: shown under Bulk tools as the "Show all payouts" table; opens the not-recorded list
+function PayoutsLedger({ embedded = false, change = null } = {}) {
   const [payouts, setPayouts] = useState(null);
   const [loaded, setLoaded] = useState(0);
+  const [reloading, setReloading] = useState(false); // Reload keeps the table on screen until the new rows arrive
   const [customers, setCustomers] = useState([]);
   const [depositRows, setDepositRows] = useState(null); // payments table rows
   const [bank, setBank] = useState(null); // { txns } | { error }
@@ -108,7 +110,7 @@ function PayoutsLedger() {
   const [sortBy, setSortBy] = useState('default'); // default | dep-desc | dep-asc | pay-desc | pay-asc
   const unrecRef = useRef(null);
   const [rejections, setRejections] = useState(null); // { keys: Set, shared } : debits set aside
-  const [showUnrec, setShowUnrec] = useState(false);
+  const [showUnrec, setShowUnrec] = useState(embedded);
   const [unrecTransfersOnly, setUnrecTransfersOnly] = useState(true);
   const [unrecSource, setUnrecSource] = useState('all');
   const [unrecMonth, setUnrecMonth] = useState('all');
@@ -118,7 +120,7 @@ function PayoutsLedger() {
 
   // ---- load everything ------------------------------------------------------
   const loadPayouts = useCallback(async () => {
-    setPayouts(null);
+    setReloading(true);
     setLoaded(0);
     setError('');
     try {
@@ -133,6 +135,8 @@ function PayoutsLedger() {
       setPayouts(rows);
     } catch (e) {
       setError(`Could not load payouts: ${e.message}`);
+    } finally {
+      setReloading(false);
     }
   }, []);
 
@@ -147,6 +151,17 @@ function PayoutsLedger() {
       .catch(() => setRejections({ keys: new Set(), shared: false }));
     loadBankIndex().then(index => setBank({ txns: index.txns })).catch(e => setBank({ error: e.message }));
   }, [loadPayouts]);
+
+  // Saves / deletes made by the Bulk tools above: apply them here instead of reloading everything
+  useEffect(() => {
+    if (!change) return;
+    const removed = new Set(change.removedIds || []);
+    const byId = new Map((change.updated || []).map(r => [r.id, r]));
+    setPayouts(prev => (prev
+      ? [...prev.filter(p => !removed.has(p.id)).map(p => byId.get(p.id) || p), ...(change.added || [])]
+      : prev));
+    if ((change.addedDeposits || []).length) setDepositRows(prev => [...(prev || []), ...change.addedDeposits]);
+  }, [change]);
 
   // Deposits per customer: totals and the rows themselves (newest first)
   const deposits = useMemo(() => {
@@ -730,10 +745,16 @@ function PayoutsLedger() {
 
   return (
     <div className="ledger">
-      <div className="cashflow-header">
-        <h2>Payouts</h2>
-        <Link to="/payouts/advanced" className="btn btn-secondary btn-sm">Bulk tools (CSV upload, duplicates)</Link>
-      </div>
+      {embedded ? (
+        <div className="cashflow-header">
+          <h3>All payouts (complete history)</h3>
+        </div>
+      ) : (
+        <div className="cashflow-header">
+          <h2>Payouts</h2>
+          <Link to="/payouts/advanced" className="btn btn-secondary btn-sm">Bulk tools &amp; all payouts</Link>
+        </div>
+      )}
 
       <div className="dashboard-stats ledger-stats">
         <div className="stat-card ledger-stat static">
@@ -855,7 +876,7 @@ function PayoutsLedger() {
         </datalist>
 
         <div className="ledger-summary">
-          {payouts === null
+          {payouts === null || reloading
             ? <span>Loading payouts… {loaded.toLocaleString('en-IN')} rows so far</span>
             : (
               <>

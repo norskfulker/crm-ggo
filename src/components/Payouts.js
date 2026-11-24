@@ -2,9 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { supabase } from '../supabase';
 import { format } from 'date-fns';
 import Papa from 'papaparse';
-import BulkUploadEditor from './BulkUploadEditor';
 import { normalizeDate, parseAmount, parseStatementText } from '../utils/statementParser';
 import BankSearchPanel from './BankSearchPanel';
+import PayoutsLedger from './PayoutsLedger';
 import { nameFromEmail, payoutAmountFor, toDisplayDate, isPayunie } from '../utils/bankSearch';
 
 // Rows in the "Add Multiple Payouts" table get a stable id so that removing a row
@@ -23,7 +23,10 @@ const createExcelRow = (overrides = {}) => ({
 function Payouts() {
   const [payouts, setPayouts] = useState([]);
   const [customers, setCustomers] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(true);   // busy: disables buttons while saving / loading
+  const [initialLoading, setInitialLoading] = useState(true); // only the very first load shows the loading screen
+  // Saves / deletes made here, passed to the "Show all payouts" table so it updates in place
+  const [ledgerChange, setLedgerChange] = useState(null);
   const [showForm, setShowForm] = useState(false);
   const [editingPayout, setEditingPayout] = useState(null);
   const [formData, setFormData] = useState({
@@ -72,40 +75,18 @@ function Payouts() {
   // New state for Excel-like table
   const [excelTableData, setExcelTableData] = useState(() => [createExcelRow()]);
   const [showExcelTable, setShowExcelTable] = useState(false);
+  // On: the new payouts table with every payout (complete history) under the bulk tools
+  const [showAllPayouts, setShowAllPayouts] = useState(true);
   const [openExcelDropdownId, setOpenExcelDropdownId] = useState(null);
   const [utrValidation, setUtrValidation] = useState({});
   // Bank Search inside "Add Multiple Payouts": follows the row being edited
   const [bankFocusRowId, setBankFocusRowId] = useState(null);
   const [showBankSearch, setShowBankSearch] = useState(true);
   
-  // Duplicate UTR deletion state
-  const [duplicateUtrs, setDuplicateUtrs] = useState([]);
-  const [showDuplicateUtrs, setShowDuplicateUtrs] = useState(false);
-  const [deletingUtrs, setDeletingUtrs] = useState(false);
-
-  // CSV Upload state
-  const [showUploadForm, setShowUploadForm] = useState(false);
-  const [uploadLoading, setUploadLoading] = useState(false);
-  const [fileInputRef] = useState(React.createRef());
-  
-  // Bulk Upload Editor state
-  const [showBulkEditor, setShowBulkEditor] = useState(false);
-  const [bulkEditorData, setBulkEditorData] = useState([]);
-  
-  // Missing entries table state
-  const [showMissingEntriesTable, setShowMissingEntriesTable] = useState(false);
-  const [missingEntriesData, setMissingEntriesData] = useState([]);
-  const [missingEntriesLoading, setMissingEntriesLoading] = useState(false);
   
   // Sorting state
   const [sortColumn, setSortColumn] = useState('date'); // Default sort by date
   const [sortDirection, setSortDirection] = useState('desc'); // Default descending
-
-  // Utility function to normalize UUIDs for comparison
-  const normalizeUUID = (uuid) => {
-    if (!uuid) return null;
-    return String(uuid).toLowerCase().trim();
-  };
 
   // Helper function to check for duplicate UTRs with pagination
   const checkDuplicateUtrsInDatabase = async (utrsToCheck) => {
@@ -184,33 +165,6 @@ function Payouts() {
 
   useEffect(() => {
     fetchData();
-    
-    // Debug function for the specific customer (removed console logs)
-    window.debugPayoutsForCustomer = async () => {
-      const customerId = '4b96557b-a516-4d66-b95e-9f279e8a8502';
-      
-      // Get all payouts for this customer
-      const { data: payouts, error: payoutsError } = await supabase
-        .from('payouts')
-        .select(`
-          *,
-          customers (email)
-        `)
-        .eq('customer_id', customerId)
-        .limit(10000);
-      
-      if (payoutsError) {
-        console.error('Error fetching payouts:', payoutsError);
-        return;
-      }
-      
-      // Check current payouts state
-      const currentPayouts = payouts.filter(p => normalizeUUID(p.customer_id) === normalizeUUID(customerId));
-    };
-    
-    return () => {
-      delete window.debugPayoutsForCustomer;
-    };
   }, []);
 
   // No need to refetch data when search term changes since we only load customer-specific data
@@ -256,16 +210,31 @@ function Payouts() {
       // Fetch payments data
       await fetchPaymentsData();
       
-      // Don't fetch all payouts initially - only when a customer is selected
-      setPayouts([]);
-      setTotalCount(0);
-      setHasMoreData(false);
     } catch (error) {
       console.error('Error fetching data:', error);
       setMessage('Error fetching data');
     } finally {
       setLoading(false);
+      setInitialLoading(false);
     }
+  };
+
+  // Apply a save / delete to what is on screen instead of reloading everything.
+  // added/updated: payout rows (with customers.email), removedIds: payout ids, addedDeposits: payments rows
+  const applyLocalChange = ({ added = [], updated = [], removedIds = [], addedDeposits = [] }) => {
+    const removed = new Set(removedIds);
+    const byId = new Map(updated.map(r => [r.id, r]));
+    const shownIds = new Set([
+      ...(selectedCustomerForFilter ? [selectedCustomerForFilter.id] : []),
+      ...selectedCustomersForFilter.map(c => c.id)
+    ]);
+    setPayouts(prev => [
+      ...added.filter(r => shownIds.has(r.customer_id)),
+      ...prev.filter(p => !removed.has(p.id)).map(p => byId.get(p.id) || p)
+    ]);
+    if (addedDeposits.length) setPaymentsData(prev => [...addedDeposits, ...prev]);
+    setLedgerChange(prev => ({ seq: (prev ? prev.seq : 0) + 1, added, updated, removedIds, addedDeposits }));
+    if (window.refreshCustomersList) window.refreshCustomersList();
   };
 
   // Function to fetch all customers
@@ -1055,87 +1024,6 @@ function Payouts() {
     }
   };
 
-  // Auto-fix date format to DD/MM/YYYY
-  const autoFixDateFormat = (dateString) => {
-    if (!dateString || dateString.trim() === '') return dateString;
-    
-    const trimmedDate = dateString.trim();
-    
-    // Handle DD-MMM-YY format (e.g., "30-Aug-22")
-    const ddMmmYyRegex = /^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/;
-    const ddMmmYyMatch = trimmedDate.match(ddMmmYyRegex);
-    
-    if (ddMmmYyMatch) {
-      const [, day, month, year] = ddMmmYyMatch;
-      const monthNames = {
-        'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
-        'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
-        'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
-      };
-      
-      const monthNum = monthNames[month.toLowerCase()];
-      if (monthNum) {
-        const fullYear = `20${year}`;
-        const paddedDay = day.padStart(2, '0');
-        return `${paddedDay}/${monthNum}/${fullYear}`;
-      }
-    }
-    
-    // Handle YYYY-MM-DD format (e.g., "2023-12-04")
-    const ymdRegex = /^(\d{4})-(\d{1,2})-(\d{1,2})$/;
-    const ymdMatch = trimmedDate.match(ymdRegex);
-    
-    if (ymdMatch) {
-      const [, year, month, day] = ymdMatch;
-      const paddedDay = day.padStart(2, '0');
-      const paddedMonth = month.padStart(2, '0');
-      return `${paddedDay}/${paddedMonth}/${year}`;
-    }
-    
-    // Handle M/D/YYYY or D/M/YYYY format (e.g., "12/4/2023", "9/1/2023")
-    // We'll assume it's M/D/YYYY format as that's more common in US/Excel
-    const mdyRegex = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/;
-    const mdyMatch = trimmedDate.match(mdyRegex);
-    
-    if (mdyMatch) {
-      const [, first, second, year] = mdyMatch;
-      const firstNum = parseInt(first);
-      const secondNum = parseInt(second);
-      
-      // If first number is > 12, it's likely a day (D/M/YYYY)
-      // If second number is > 12, it's likely M/D/YYYY
-      // Default to M/D/YYYY format
-      let month, day;
-      
-      if (firstNum > 12 && secondNum <= 12) {
-        // D/M/YYYY format
-        day = first;
-        month = second;
-      } else {
-        // M/D/YYYY format (default)
-        month = first;
-        day = second;
-      }
-      
-      const paddedDay = day.padStart(2, '0');
-      const paddedMonth = month.padStart(2, '0');
-      return `${paddedDay}/${paddedMonth}/${year}`;
-    }
-    
-    // If it's already in DD/MM/YYYY format, just ensure proper padding
-    const ddmmRegex = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/;
-    const ddmmMatch = trimmedDate.match(ddmmRegex);
-    
-    if (ddmmMatch) {
-      const [, day, month, year] = ddmmMatch;
-      const paddedDay = day.padStart(2, '0');
-      const paddedMonth = month.padStart(2, '0');
-      return `${paddedDay}/${paddedMonth}/${year}`;
-    }
-    
-    // Return original if no pattern matches
-    return trimmedDate;
-  };
 
   // Validate date format and range
   const validateDate = (dateString) => {
@@ -1296,20 +1184,19 @@ function Payouts() {
           };
         });
 
-      const { error } = await supabase
+      const { data: inserted, error } = await supabase
         .from('payouts')
-        .insert(payoutsToInsert);
+        .insert(payoutsToInsert)
+        .select(`
+          *,
+          customers (email)
+        `);
 
       if (error) throw error;
       setMessage(`Successfully added ${validRows.length} payout(s)`);
       
       closeExcelTable();
-      fetchData();
-      
-      // Refresh customers list to update payout totals
-      if (window.refreshCustomersList) {
-        window.refreshCustomersList();
-      }
+      applyLocalChange({ added: inserted || [] });
     } catch (error) {
       console.error('Error saving payouts:', error);
       setMessage('Error saving payouts');
@@ -1346,13 +1233,18 @@ function Payouts() {
           notes: formData.payouts[0].notes
         };
 
-        const { error } = await supabase
+        const { data: updatedRows, error } = await supabase
           .from('payouts')
           .update(payoutData)
-          .eq('id', editingPayout.id);
+          .eq('id', editingPayout.id)
+          .select(`
+          *,
+          customers (email)
+        `);
 
         if (error) throw error;
         setMessage('Payout updated successfully');
+        applyLocalChange({ updated: updatedRows || [] });
       } else {
         // Handle multiple payouts insert
         const validPayouts = formData.payouts.filter(payout => 
@@ -1408,12 +1300,17 @@ function Payouts() {
           notes: payout.notes
         }));
 
-        const { error } = await supabase
+        const { data: inserted, error } = await supabase
           .from('payouts')
-          .insert(payoutsToInsert);
+          .insert(payoutsToInsert)
+          .select(`
+          *,
+          customers (email)
+        `);
 
         if (error) throw error;
         setMessage(`Successfully added ${validPayouts.length} payout(s)`);
+        applyLocalChange({ added: inserted || [] });
       }
 
       setFormData({
@@ -1429,12 +1326,6 @@ function Payouts() {
       setCustomerSearch('');
       setShowForm(false);
       setEditingPayout(null);
-      fetchData();
-      
-      // Refresh customers list to update payout totals
-      if (window.refreshCustomersList) {
-        window.refreshCustomersList();
-      }
     } catch (error) {
       console.error('Error saving payout:', error);
       setMessage('Error saving payout');
@@ -1470,12 +1361,7 @@ function Payouts() {
 
       if (error) throw error;
       setMessage('Payout deleted successfully');
-      fetchData();
-      
-      // Refresh customers list to update payout totals
-      if (window.refreshCustomersList) {
-        window.refreshCustomersList();
-      }
+      applyLocalChange({ removedIds: [id] });
     } catch (error) {
       console.error('Error deleting payout:', error);
       setMessage('Error deleting payout');
@@ -1606,420 +1492,6 @@ function Payouts() {
     document.body.removeChild(link);
   };
 
-     const downloadSampleCSV = () => {
-     const sampleData = [
-       {
-         'Customer Email': 'john.doe@example.com',
-         'Amount (INR)': '8000',
-         'Date': '01/01/2024',
-         'UTR': 'UTR123456789',
-         'Notes': 'Sample payout'
-       },
-       {
-         'Customer Email': 'jane.smith@example.com',
-         'Amount (INR)': '12000',
-         'Date': '02/01/2024',
-         'UTR': 'UTR987654321',
-         'Notes': 'Another payout'
-       },
-       {
-         'Customer Email': 'bob.johnson@example.com',
-         'Amount (INR)': '15000',
-         'Date': '03/01/2024',
-         'UTR': 'UTR456789123',
-         'Notes': 'Third payout'
-       },
-       {
-         'Customer Email': 'alice.wilson@example.com',
-         'Amount (INR)': '10000',
-         'Date': '04/01/2024',
-         'UTR': '',
-         'Notes': 'This entry will show an error - UTR is required'
-       }
-     ];
-
-    const csv = Papa.unparse(sampleData);
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    const url = URL.createObjectURL(blob);
-    link.setAttribute('href', url);
-    link.setAttribute('download', 'sample_payouts.csv');
-    link.style.visibility = 'hidden';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
-
-    const handleMissingEntriesSubmit = async (e) => {
-    e.preventDefault();
-    setMissingEntriesLoading(true);
-
-    try {
-             // Validate data
-       const validRows = missingEntriesData.filter(row => 
-         row.customer_email && row.amount_inr && row.amount_inr > 0 && validateDate(row.date) && row.utr && row.utr.trim()
-       );
-
-             if (validRows.length === 0) {
-         setMessage('Please fix at least one valid payout row with customer, amount, and UTR');
-         setMissingEntriesLoading(false);
-         return;
-       }
-
-      // Get customer IDs for all emails
-      const customerEmails = [...new Set(validRows.map(row => row.customer_email))];
-      const { data: customerData, error: customerError } = await supabase
-        .from('customers')
-        .select('id, email')
-        .in('email', customerEmails);
-
-      if (customerError) throw customerError;
-
-      const customerMap = {};
-      customerData.forEach(customer => {
-        customerMap[customer.email] = customer.id;
-      });
-
-      // Check for missing customers
-      const missingEmails = customerEmails.filter(email => !customerMap[email]);
-      if (missingEmails.length > 0) {
-        setMessage(`Customers not found: ${missingEmails.join(', ')}`);
-        setMissingEntriesLoading(false);
-        return;
-      }
-
-      // Check for UTR duplicates
-      const utrsToCheck = validRows
-        .map(row => row.utr)
-        .filter(utr => utr && utr.trim() !== '');
-
-      if (utrsToCheck.length > 0) {
-        const { data: existingPayments, error: paymentsCheckError } = await supabase
-          .from('payments')
-          .select('utr')
-          .in('utr', utrsToCheck);
-
-        if (paymentsCheckError) throw paymentsCheckError;
-
-        const { data: existingPayouts, error: payoutsCheckError } = await supabase
-          .from('payouts')
-          .select('notes')
-          .in('notes', utrsToCheck);
-
-        if (payoutsCheckError) throw payoutsCheckError;
-
-        const existingUtrs = [
-          ...(existingPayments || []).map(p => p.utr),
-          ...(existingPayouts || []).map(p => p.notes)
-        ];
-
-        const duplicateUtrs = utrsToCheck.filter(utr => existingUtrs.includes(utr));
-
-        if (duplicateUtrs.length > 0) {
-          setMessage(`UTR(s) already exist: ${duplicateUtrs.join(', ')}. Please use a different UTR.`);
-          setMissingEntriesLoading(false);
-          return;
-        }
-      }
-
-      // Prepare payouts for insertion
-      const payoutsToInsert = validRows.map(row => {
-        // Convert date to YYYY-MM-DD format for database
-        let dbDate = row.date;
-        
-        // Handle DD-MMM-YY format (e.g., "30-Aug-22")
-        const ddMmmYyRegex = /^(\d{1,2})-([A-Za-z]{3})-(\d{2})$/;
-        const ddMmmYyMatch = row.date.match(ddMmmYyRegex);
-        
-        if (ddMmmYyMatch) {
-          const [, day, month, year] = ddMmmYyMatch;
-          const monthNames = {
-            'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
-            'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
-            'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
-          };
-          
-          const monthNum = monthNames[month.toLowerCase()];
-          if (monthNum) {
-            const fullYear = `20${year}`;
-            const paddedDay = day.padStart(2, '0');
-            dbDate = `${fullYear}-${monthNum}-${paddedDay}`;
-          }
-        } else if (row.date.includes('/')) {
-          // Handle DD/MM/YYYY format
-          const [day, month, year] = row.date.split('/');
-          dbDate = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
-        }
-        
-        return {
-          customer_id: customerMap[row.customer_email],
-          amount_inr: parseFloat(row.amount_inr),
-          date: dbDate,
-          utr: row.utr,
-          notes: row.notes
-        };
-      });
-
-      const { error } = await supabase
-        .from('payouts')
-        .insert(payoutsToInsert);
-
-      if (error) throw error;
-      setMessage(`Successfully added ${validRows.length} corrected payout(s)`);
-      
-      // Reset form
-      setMissingEntriesData([]);
-      setShowMissingEntriesTable(false);
-      fetchData();
-    } catch (error) {
-      console.error('Error saving corrected payouts:', error);
-      setMessage('Error saving corrected payouts');
-    } finally {
-      setMissingEntriesLoading(false);
-    }
-  };
-
-  const updateMissingEntry = (index, field, value) => {
-    const newData = [...missingEntriesData];
-    newData[index] = {
-      ...newData[index],
-      [field]: value
-    };
-    setMissingEntriesData(newData);
-  };
-
-  const removeMissingEntry = (index) => {
-    setMissingEntriesData(missingEntriesData.filter((_, i) => i !== index));
-  };
-
-  const handleFileUpload = (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-
-    if (file.type !== 'text/csv' && !file.name.endsWith('.csv')) {
-      setMessage('Please select a valid CSV file');
-      return;
-    }
-
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: async (results) => {
-        if (results.errors.length > 0) {
-          const realErrors = results.errors.filter(error => 
-            !error.message.includes('Unable to auto-detect delimiting character')
-          );
-          
-          if (realErrors.length > 0) {
-            setMessage(`Error parsing CSV file: ${realErrors[0].message || 'Please check the format.'}`);
-            return;
-          }
-        }
-
-        // Check if the CSV has the required columns
-        const requiredColumns = ['Customer Email', 'Amount (INR)', 'Date'];
-        const missingColumns = requiredColumns.filter(col => !results.data[0] || !results.data[0].hasOwnProperty(col));
-        
-        if (missingColumns.length > 0) {
-          setMessage(`CSV file is missing required columns: ${missingColumns.join(', ')}`);
-          return;
-        }
-
-        // Filter rows that have required data
-        const payouts = results.data.filter(row => {
-          return row['Customer Email'] && 
-                 row['Amount (INR)'] && 
-                 row['Amount (INR)'].toString().trim() !== '' &&
-                 row['Date'] && 
-                 row['Date'].toString().trim() !== '';
-        });
-        
-        if (payouts.length === 0) {
-          setMessage('No valid payout data found in CSV. Please ensure the file has the required columns with data.');
-          return;
-        }
-
-        setUploadLoading(true);
-        try {
-          // Get existing UTRs to check for duplicates (using notes field for payouts)
-          const { data: existingPayouts, error: fetchError } = await supabase
-            .from('payouts')
-            .select('notes')
-            .not('notes', 'is', null);
-
-          if (fetchError) throw fetchError;
-
-          const existingUTRs = new Set(existingPayouts.map(payout => payout.notes?.toLowerCase().trim()).filter(Boolean));
-
-          // Process CSV data and identify issues
-          const payoutsToInsert = [];
-          const duplicates = [];
-          const invalidEntries = [];
-          const newlyCreatedCustomers = [];
-
-          for (const payout of payouts) {
-            const customerEmail = payout['Customer Email'].trim().toLowerCase();
-            const utr = payout['UTR']?.trim() || '';
-            const utrLower = utr.toLowerCase();
-            const originalDate = payout['Date']?.trim() || '';
-            const originalAmount = payout['Amount (INR)']?.toString() || '';
-
-            // Check for missing UTR/Notes - this is required for payouts
-            if (!utr && !payout['Notes']?.trim()) {
-              invalidEntries.push({
-                ...payout,
-                error: 'UTR/Notes is required for payouts'
-              });
-              continue;
-            }
-
-            // Check for duplicate UTR
-            if (utr && existingUTRs.has(utrLower)) {
-              duplicates.push(utr);
-              continue;
-            }
-
-            // Find customer by email
-            let customer = customers.find(c => c.email.toLowerCase() === customerEmail);
-            
-            // If customer doesn't exist, create them automatically
-            if (!customer) {
-              try {
-                const { data: newCustomer, error: createError } = await supabase
-                  .from('customers')
-                  .insert([{ email: payout['Customer Email'].trim() }])
-                  .select()
-                  .single();
-
-                if (createError) {
-                  // If there's an error (like duplicate email), try to fetch the existing customer
-                  const { data: existingCustomer, error: fetchError } = await supabase
-                    .from('customers')
-                    .select('*')
-                    .eq('email', payout['Customer Email'].trim())
-                    .single();
-
-                  if (fetchError || !existingCustomer) {
-                    invalidEntries.push({
-                      ...payout,
-                      error: 'Customer not found and could not be created'
-                    });
-                    continue;
-                  }
-                  customer = existingCustomer;
-                } else {
-                  customer = newCustomer;
-                  newlyCreatedCustomers.push(customer);
-                }
-              } catch (error) {
-                console.error('Error creating customer:', error);
-                invalidEntries.push({
-                  ...payout,
-                  error: 'Error creating customer'
-                });
-                continue;
-              }
-            }
-
-            // Parse date - use auto-fix function to handle various formats
-            let parsedDate;
-            try {
-              // Auto-fix the date format first
-              const fixedDate = autoFixDateFormat(originalDate);
-              
-              // Convert DD/MM/YYYY to YYYY-MM-DD for database
-              if (fixedDate.includes('/')) {
-                const [day, month, year] = fixedDate.split('/');
-                parsedDate = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
-              } else {
-                parsedDate = new Date(fixedDate).toISOString().split('T')[0];
-              }
-            } catch (error) {
-              invalidEntries.push({
-                ...payout,
-                error: 'Invalid date format'
-              });
-              continue;
-            }
-
-            // Parse amount
-            const amount = parseFloat(originalAmount.replace(/[^\d.-]/g, ''));
-            if (isNaN(amount) || amount <= 0) {
-              invalidEntries.push({
-                ...payout,
-                error: 'Invalid amount'
-              });
-              continue;
-            }
-
-            payoutsToInsert.push({
-              customer_id: customer.id,
-              amount_inr: amount,
-              date: parsedDate,
-              notes: utr || payout['Notes']?.trim() || ''
-            });
-
-            if (utr) {
-              existingUTRs.add(utrLower);
-            }
-          }
-
-          // Always show the bulk editor for preview and editing
-          // Add newly created customers to the customers list for the bulk editor
-          if (newlyCreatedCustomers.length > 0) {
-            setCustomers(prevCustomers => [...newlyCreatedCustomers, ...prevCustomers]);
-          }
-          
-          // Prepare all entries for the bulk editor
-          const allEntries = [];
-          
-          // Add invalid entries first (they will be at the top due to sorting)
-          invalidEntries.forEach(entry => {
-            const customerEmail = entry['Customer Email'].trim().toLowerCase();
-            const isNewCustomer = newlyCreatedCustomers.some(c => c.email.toLowerCase() === customerEmail);
-            allEntries.push({
-              ...entry,
-              isNewCustomer,
-              newlyCreatedCustomer: isNewCustomer ? newlyCreatedCustomers.find(c => c.email.toLowerCase() === customerEmail) : null
-            });
-          });
-          
-          // Add valid entries
-          payouts.forEach(payout => {
-            const customerEmail = payout['Customer Email'].trim().toLowerCase();
-            const isNewCustomer = newlyCreatedCustomers.some(c => c.email.toLowerCase() === customerEmail);
-            
-            // Auto-fix the date format for display in bulk editor
-            const fixedDate = autoFixDateFormat(payout['Date']?.toString().trim() || '');
-            
-            allEntries.push({
-              ...payout,
-              'Date': fixedDate, // Use the fixed date format
-              isNewCustomer,
-              newlyCreatedCustomer: isNewCustomer ? newlyCreatedCustomers.find(c => c.email.toLowerCase() === customerEmail) : null
-            });
-          });
-          
-          setBulkEditorData(allEntries);
-          setShowBulkEditor(true);
-          setShowUploadForm(false);
-          if (fileInputRef.current) {
-            fileInputRef.current.value = '';
-          }
-          setUploadLoading(false);
-        } catch (error) {
-          console.error('Error importing payouts:', error);
-          setMessage('Error importing payouts. Please try again.');
-        } finally {
-          setUploadLoading(false);
-        }
-      },
-      error: (error) => {
-        console.error('CSV parsing error:', error);
-        setMessage('Error reading CSV file. Please check the file format.');
-      }
-    });
-  };
 
   const handleSelectPayout = (payoutId) => {
     setSelectedPayouts(prev => 
@@ -2027,24 +1499,6 @@ function Payouts() {
         ? prev.filter(id => id !== payoutId)
         : [...prev, payoutId]
     );
-  };
-
-  // Bulk editor handlers
-  const handleBulkEditorSave = (count) => {
-    setMessage(`Successfully imported ${count} payouts from bulk editor`);
-    setShowBulkEditor(false);
-    setBulkEditorData([]);
-    fetchData();
-    
-    // Refresh customers list to update payout totals
-    if (window.refreshCustomersList) {
-      window.refreshCustomersList();
-    }
-  };
-
-  const handleBulkEditorCancel = () => {
-    setShowBulkEditor(false);
-    setBulkEditorData([]);
   };
 
   const handleSelectAll = () => {
@@ -2295,9 +1749,13 @@ function Payouts() {
           notes: '' // Clear notes when moving to payments
         }));
 
-      const { error: insertError } = await supabase
+      const { data: insertedPayments, error: insertError } = await supabase
         .from('payments')
-        .insert(paymentsToInsert);
+        .insert(paymentsToInsert)
+        .select(`
+          *,
+          customers (email)
+        `);
 
       if (insertError) throw insertError;
 
@@ -2310,125 +1768,14 @@ function Payouts() {
       if (deleteError) throw deleteError;
 
       setMessage(`Successfully moved ${selectedPayouts.length} payout(s) to payments`);
+      applyLocalChange({ removedIds: selectedPayouts, addedDeposits: insertedPayments || [] });
       setSelectedPayouts([]);
       setSelectAll(false);
-      fetchData();
-      
-      // Refresh customers list to update totals
-      if (window.refreshCustomersList) {
-        window.refreshCustomersList();
-      }
     } catch (error) {
       console.error('Error moving payouts:', error);
       setMessage('Error moving payouts to payments');
     } finally {
       setLoading(false);
-    }
-  };
-
-  // Function to check for duplicate UTRs across both payments and payouts
-  const checkDuplicateUtrs = async () => {
-    try {
-      console.log('=== CHECKING DUPLICATE UTRS ===');
-      
-      // Get all UTRs from payments table with pagination
-      let allPaymentsData = [];
-      let hasMorePayments = true;
-      let fromPayments = 0;
-      const pageSize = 1000;
-      
-      while (hasMorePayments) {
-        console.log(`Fetching payments from ${fromPayments} to ${fromPayments + pageSize}...`);
-        const { data: paymentsPage, error: paymentsError } = await supabase
-          .from('payments')
-          .select('utr, id, customers(email), amount_inr, date')
-          .not('utr', 'is', null)
-          .range(fromPayments, fromPayments + pageSize - 1);
-
-        if (paymentsError) throw paymentsError;
-        
-        if (paymentsPage && paymentsPage.length > 0) {
-          allPaymentsData = [...allPaymentsData, ...paymentsPage];
-          fromPayments += pageSize;
-          
-          if (paymentsPage.length < pageSize) {
-            hasMorePayments = false;
-          }
-        } else {
-          hasMorePayments = false;
-        }
-      }
-      
-      console.log(`Total payments fetched: ${allPaymentsData.length}`);
-
-      // Get all UTRs from payouts table (using notes field) with pagination
-      let allPayoutsData = [];
-      let hasMorePayouts = true;
-      let fromPayouts = 0;
-      
-      while (hasMorePayouts) {
-        console.log(`Fetching payouts from ${fromPayouts} to ${fromPayouts + pageSize}...`);
-        const { data: payoutsPage, error: payoutsError } = await supabase
-          .from('payouts')
-          .select('notes, id, customers(email), amount_inr, date')
-          .not('notes', 'is', null)
-          .range(fromPayouts, fromPayouts + pageSize - 1);
-
-        if (payoutsError) throw payoutsError;
-        
-        if (payoutsPage && payoutsPage.length > 0) {
-          allPayoutsData = [...allPayoutsData, ...payoutsPage];
-          fromPayouts += pageSize;
-          
-          if (payoutsPage.length < pageSize) {
-            hasMorePayouts = false;
-          }
-        } else {
-          hasMorePayouts = false;
-        }
-      }
-      
-      console.log(`Total payouts fetched: ${allPayoutsData.length}`);
-
-      // Combine all UTRs
-      const allUtrs = [
-        ...allPaymentsData.map(p => ({ utr: p.utr, type: 'payment', id: p.id, customer: p.customers?.email, amount: p.amount_inr, date: p.date })),
-        ...allPayoutsData.map(p => ({ utr: p.notes, type: 'payout', id: p.id, customer: p.customers?.email, amount: p.amount_inr, date: p.date }))
-      ];
-
-      // Find duplicates
-      const utrCounts = {};
-      const duplicateUtrs = [];
-
-      allUtrs.forEach(item => {
-        if (item.utr) {
-          if (!utrCounts[item.utr]) {
-            utrCounts[item.utr] = [];
-          }
-          utrCounts[item.utr].push(item);
-        }
-      });
-
-      Object.keys(utrCounts).forEach(utr => {
-        if (utrCounts[utr].length > 1) {
-          duplicateUtrs.push({
-            utr: utr,
-            items: utrCounts[utr]
-          });
-        }
-      });
-
-      console.log(`Total UTRs processed: ${Object.keys(utrCounts).length}`);
-      console.log(`Duplicate UTRs found: ${duplicateUtrs.length}`);
-      if (duplicateUtrs.length > 0) {
-        console.log('Duplicate UTRs:', duplicateUtrs.map(d => d.utr));
-      }
-      console.log('=== END CHECKING DUPLICATE UTRS ===');
-
-      return duplicateUtrs;
-    } catch (error) {
-      console.error('Error checking duplicate UTRs:', error);
-      return [];
     }
   };
 
@@ -2451,24 +1798,10 @@ function Payouts() {
 
       if (error) throw error;
 
-      // Check for duplicate UTRs after deletion
-      const duplicateUtrs = await checkDuplicateUtrs();
-
-      let message = `Successfully deleted ${selectedPayouts.length} payout(s)`;
-      
-      if (duplicateUtrs.length > 0) {
-        message += `. ⚠️ Found ${duplicateUtrs.length} duplicate UTR(s) remaining in the system: ${duplicateUtrs.map(d => d.utr).join(', ')}`;
-      }
-
-      setMessage(message);
+      setMessage(`Successfully deleted ${selectedPayouts.length} payout(s)`);
+      applyLocalChange({ removedIds: selectedPayouts });
       setSelectedPayouts([]);
       setSelectAll(false);
-      fetchData();
-      
-      // Refresh customers list to update payout totals
-      if (window.refreshCustomersList) {
-        window.refreshCustomersList();
-      }
     } catch (error) {
       console.error('Error deleting payouts:', error);
       setMessage('Error deleting payouts');
@@ -2477,138 +1810,7 @@ function Payouts() {
     }
   };
 
-  const bulkDeletePayoutsWithoutUtr = async () => {
-    const payoutsWithoutUtr = payouts.filter(payout => !payout.notes || !payout.notes.trim());
-    
-    if (payoutsWithoutUtr.length === 0) {
-      setMessage('No payouts found without UTR');
-      return;
-    }
-
-    if (!window.confirm(`Are you sure you want to delete ${payoutsWithoutUtr.length} payout(s) that are missing UTR? This action cannot be undone.`)) {
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const payoutIdsToDelete = payoutsWithoutUtr.map(payout => payout.id);
-      
-      const { error } = await supabase
-        .from('payouts')
-        .delete()
-        .in('id', payoutIdsToDelete);
-
-      if (error) throw error;
-
-      // Check for duplicate UTRs after deletion
-      const duplicateUtrs = await checkDuplicateUtrs();
-
-      let message = `Successfully deleted ${payoutsWithoutUtr.length} payout(s) without UTR`;
-      
-      if (duplicateUtrs.length > 0) {
-        message += `. ⚠️ Found ${duplicateUtrs.length} duplicate UTR(s) remaining in the system: ${duplicateUtrs.map(d => d.utr).join(', ')}`;
-      }
-
-      setMessage(message);
-      setSelectedPayouts([]);
-      setSelectAll(false);
-      fetchData();
-      
-      // Refresh customers list to update payout totals
-      if (window.refreshCustomersList) {
-        window.refreshCustomersList();
-      }
-    } catch (error) {
-      console.error('Error deleting payouts without UTR:', error);
-      setMessage('Error deleting payouts without UTR');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const deleteDuplicateUtrs = async () => {
-    if (duplicateUtrs.length === 0) return;
-    
-    // Calculate how many duplicates will be deleted (excluding originals)
-    const totalDuplicates = duplicateUtrs.reduce((total, item) => total + (item.items.length - 1), 0);
-    
-    if (!window.confirm(`Are you sure you want to delete duplicate entries only? This will keep the original entry for each UTR and delete ${totalDuplicates} duplicate entries. This action cannot be undone.`)) {
-      return;
-    }
-    
-    setDeletingUtrs(true);
-    
-    try {
-      // Get IDs to delete (excluding the first/original entry for each UTR)
-      const paymentIds = [];
-      const payoutIds = [];
-      
-      duplicateUtrs.forEach(item => {
-        // Sort items by date to keep the oldest entry as original
-        const sortedItems = item.items.sort((a, b) => {
-          const dateA = new Date(a.date);
-          const dateB = new Date(b.date);
-          return dateA - dateB; // Keep the oldest entry
-        });
-        
-        // Keep the first (oldest) entry, delete the rest
-        const duplicatesToDelete = sortedItems.slice(1);
-        
-        duplicatesToDelete.forEach(entry => {
-          if (entry.type === 'payment') {
-            paymentIds.push(entry.id);
-          } else if (entry.type === 'payout') {
-            payoutIds.push(entry.id);
-          }
-        });
-      });
-      
-      console.log(`Deleting ${paymentIds.length} duplicate payments and ${payoutIds.length} duplicate payouts`);
-      
-      // Delete payments with duplicate UTRs
-      if (paymentIds.length > 0) {
-        const { error: paymentsError } = await supabase
-          .from('payments')
-          .delete()
-          .in('id', paymentIds);
-        
-        if (paymentsError) throw paymentsError;
-      }
-      
-      // Delete payouts with duplicate UTRs
-      if (payoutIds.length > 0) {
-        const { error: payoutsError } = await supabase
-          .from('payouts')
-          .delete()
-          .in('id', payoutIds);
-        
-        if (payoutsError) throw payoutsError;
-      }
-      
-      const totalDeleted = paymentIds.length + payoutIds.length;
-      setMessage(`Successfully deleted ${totalDeleted} duplicate entries. Original entries have been preserved.`);
-      setDuplicateUtrs([]);
-      setShowDuplicateUtrs(false);
-      
-      // Refresh data
-      fetchData();
-      
-      // Refresh customers list to update totals
-      if (window.refreshCustomersList) {
-        window.refreshCustomersList();
-      }
-      
-    } catch (error) {
-      console.error('Error deleting duplicate UTRs:', error);
-      setMessage('Error deleting duplicate UTRs');
-    } finally {
-      setDeletingUtrs(false);
-    }
-  };
-
-
-
-  if (loading) {
+  if (initialLoading) {
     return (
       <div className="card">
         <h2>Loading...</h2>
@@ -2631,59 +1833,21 @@ function Payouts() {
           <button onClick={() => setShowExcelTable(true)} className="btn btn-primary">
             Add Multiple Payouts
           </button>
-          <button onClick={() => setShowForm(true)} className="btn btn-secondary" style={{ marginLeft: '0.5rem' }}>
-            Add Single Payout
-          </button>
-          <button onClick={() => setShowUploadForm(true)} className="btn btn-success" style={{ marginLeft: '0.5rem' }}>
-            Upload CSV
-          </button>
           <button onClick={exportToCSV} className="btn btn-secondary" style={{ marginLeft: '0.5rem' }}>
             Export CSV
           </button>
           <button onClick={fetchData} className="btn btn-warning" style={{ marginLeft: '0.5rem' }} disabled={loading}>
             {loading ? 'Refreshing...' : 'Refresh Data'}
           </button>
-          <button 
-            onClick={() => window.debugPayoutsForCustomer && window.debugPayoutsForCustomer()} 
-            className="btn btn-info" 
-            style={{ marginLeft: '0.5rem' }}
-            title="Debug payouts for specific customer"
-          >
-            Debug Payouts
-          </button>
-                     <button 
-             onClick={async () => {
-               setLoading(true);
-               const duplicates = await checkDuplicateUtrs();
-               if (duplicates.length > 0) {
-                 setDuplicateUtrs(duplicates);
-                 setShowDuplicateUtrs(true);
-                 setMessage(`⚠️ Found ${duplicates.length} duplicate UTR(s). Review and delete if needed.`);
-               } else {
-                 setMessage('✅ No duplicate UTRs found in the system');
-                 setShowDuplicateUtrs(false);
-                 setDuplicateUtrs([]);
-               }
-               setLoading(false);
-             }} 
-             className="btn btn-warning" 
-             style={{ marginLeft: '0.5rem' }}
-             disabled={loading}
-           >
-             {loading ? 'Checking...' : 'Check Duplicate UTRs'}
-           </button>
-           <button 
-             onClick={bulkDeletePayoutsWithoutUtr} 
-             className="btn btn-danger" 
-             style={{ marginLeft: '0.5rem' }}
-             disabled={loading}
-           >
-             {loading ? 'Deleting...' : `Delete All Without UTR (${payouts.filter(payout => !payout.notes || !payout.notes.trim()).length})`}
-           </button>
+          <label style={{ marginLeft: '1rem', cursor: 'pointer', whiteSpace: 'nowrap' }} title="Show every payout ever recorded in the payouts table below">
+            <input type="checkbox" checked={showAllPayouts} onChange={e => setShowAllPayouts(e.target.checked)} /> Show all payouts
+          </label>
         </div>
       </div>
 
 
+      {!showAllPayouts && (
+      <>
       {/* View Mode Toggle */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
         <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
@@ -2755,124 +1919,12 @@ function Payouts() {
          </div>
        )}
 
+      </>
+      )}
+
       {message && (
         <div className={`alert ${message.includes('Error') ? 'alert-error' : 'alert-success'}`}>
           {message}
-        </div>
-      )}
-
-      {/* Duplicate UTRs Section */}
-      {showDuplicateUtrs && duplicateUtrs.length > 0 && (
-        <div className="card" style={{ marginBottom: '1rem', border: '2px solid #f59e0b', backgroundColor: '#fef3c7' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <div>
-              <h3 style={{ margin: 0, fontSize: '1.2rem', color: '#92400e' }}>
-                ⚠️ Duplicate UTRs Found ({duplicateUtrs.length})
-              </h3>
-              <div style={{ fontSize: '0.9rem', color: '#92400e', marginTop: '0.25rem' }}>
-                The following UTRs have multiple entries. You can delete duplicate entries only (keeping the original) to clean up the system.
-              </div>
-            </div>
-            <div>
-              <button 
-                onClick={deleteDuplicateUtrs}
-                className="btn btn-danger"
-                disabled={deletingUtrs}
-                style={{ marginRight: '0.5rem' }}
-              >
-                {deletingUtrs ? 'Deleting...' : `Delete Duplicates Only (${duplicateUtrs.reduce((total, item) => total + (item.items.length - 1), 0)} entries)`}
-              </button>
-              <button 
-                onClick={() => {
-                  setShowDuplicateUtrs(false);
-                  setDuplicateUtrs([]);
-                }} 
-                className="btn btn-secondary"
-                style={{ padding: '0.25rem 0.5rem', fontSize: '0.9rem' }}
-              >
-                × Close
-              </button>
-            </div>
-          </div>
-          
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ 
-              width: '100%', 
-              borderCollapse: 'collapse', 
-              border: '1px solid #ddd',
-              fontSize: '0.9rem'
-            }}>
-              <thead>
-                <tr style={{ backgroundColor: '#fef3c7' }}>
-                  <th style={{ padding: '0.75rem', border: '1px solid #ddd', textAlign: 'left' }}>UTR</th>
-                  <th style={{ padding: '0.75rem', border: '1px solid #ddd', textAlign: 'left' }}>Type</th>
-                  <th style={{ padding: '0.75rem', border: '1px solid #ddd', textAlign: 'left' }}>Customer</th>
-                  <th style={{ padding: '0.75rem', border: '1px solid #ddd', textAlign: 'left' }}>Amount</th>
-                  <th style={{ padding: '0.75rem', border: '1px solid #ddd', textAlign: 'left' }}>Date</th>
-                  <th style={{ padding: '0.75rem', border: '1px solid #ddd', textAlign: 'left' }}>ID</th>
-                </tr>
-              </thead>
-              <tbody>
-                {duplicateUtrs.map((item, index) => {
-                  // Sort items by date to identify the original (oldest)
-                  const sortedItems = item.items.sort((a, b) => {
-                    const dateA = new Date(a.date);
-                    const dateB = new Date(b.date);
-                    return dateA - dateB;
-                  });
-                  
-                  return (
-                    <React.Fragment key={index}>
-                      {sortedItems.map((entry, entryIndex) => (
-                        <tr key={`${index}-${entryIndex}`} style={{ 
-                          backgroundColor: entryIndex === 0 ? '#d4edda' : (entryIndex % 2 === 0 ? '#fff' : '#f8f9fa'),
-                          border: entryIndex === 0 ? '2px solid #28a745' : '1px solid #ddd'
-                        }}>
-                          <td style={{ padding: '0.75rem', border: '1px solid #ddd', fontWeight: 'bold' }}>
-                            {entry.utr}
-                            {entryIndex === 0 && (
-                              <span style={{ 
-                                marginLeft: '0.5rem', 
-                                backgroundColor: '#28a745', 
-                                color: 'white', 
-                                padding: '0.2rem 0.4rem', 
-                                borderRadius: '4px', 
-                                fontSize: '0.7rem',
-                                fontWeight: 'bold'
-                              }}>
-                                ORIGINAL
-                              </span>
-                            )}
-                          </td>
-                          <td style={{ padding: '0.75rem', border: '1px solid #ddd' }}>
-                            <span style={{
-                              backgroundColor: entry.type === 'payment' ? '#10B981' : '#F59E0B',
-                              color: 'white',
-                              padding: '0.25rem 0.5rem',
-                              borderRadius: '4px',
-                              fontSize: '0.8rem',
-                              fontWeight: 'bold'
-                            }}>
-                              {entry.type === 'payment' ? 'Payment' : 'Payout'}
-                            </span>
-                          </td>
-                          <td style={{ padding: '0.75rem', border: '1px solid #ddd' }}>{entry.customer || '-'}</td>
-                          <td style={{ padding: '0.75rem', border: '1px solid #ddd' }}>₹{entry.amount?.toLocaleString() || '-'}</td>
-                          <td style={{ padding: '0.75rem', border: '1px solid #ddd' }}>{entry.date ? format(new Date(entry.date), 'dd/MM/yyyy') : '-'}</td>
-                          <td style={{ padding: '0.75rem', border: '1px solid #ddd', fontSize: '0.8rem', color: '#666' }}>{entry.id}</td>
-                        </tr>
-                      ))}
-                    </React.Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-          
-          <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#fff3cd', border: '1px solid #ffeaa7', borderRadius: '4px' }}>
-            <strong>⚠️ Warning:</strong> Clicking "Delete Duplicates Only" will keep the original entry (oldest by date) for each UTR and delete only the duplicate entries. 
-            This action cannot be undone. {duplicateUtrs.reduce((total, item) => total + (item.items.length - 1), 0)} duplicate entries will be deleted.
-          </div>
         </div>
       )}
 
@@ -3114,262 +2166,6 @@ function Payouts() {
         </div>
       )}
 
-       {/* Missing Entries Table */}
-       {showMissingEntriesTable && (
-         <div className="card" style={{ marginBottom: '1rem', border: '2px solid #ffc107' }}>
-           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-             <div>
-               <h3 style={{ margin: 0, fontSize: '1.2rem', color: '#856404' }}>⚠️ Fix Missing/Invalid Entries</h3>
-               <div style={{ fontSize: '0.8rem', color: '#856404', marginTop: '0.25rem' }}>
-                 Please fix the errors below and save the corrected entries
-               </div>
-             </div>
-             <button 
-               onClick={() => {
-                 setShowMissingEntriesTable(false);
-                 setMissingEntriesData([]);
-               }} 
-               className="btn btn-secondary"
-               style={{ padding: '0.25rem 0.5rem', fontSize: '0.9rem' }}
-             >
-               × Close
-             </button>
-           </div>
-           
-           <form onSubmit={handleMissingEntriesSubmit}>
-             <div style={{ marginBottom: '1rem', position: 'relative' }}>
-               <div style={{ overflowX: 'auto' }}>
-                 <table style={{ 
-                   width: '100%', 
-                   borderCollapse: 'collapse', 
-                   border: '1px solid #ddd',
-                   fontSize: '0.9rem'
-                 }}>
-                   <thead>
-                     <tr style={{ backgroundColor: '#fff3cd' }}>
-                       <th style={{ 
-                         padding: '0.75rem', 
-                         border: '1px solid #ddd', 
-                         textAlign: 'left',
-                         minWidth: '200px'
-                       }}>
-                         Customer Email *
-                       </th>
-                       <th style={{ 
-                         padding: '0.75rem', 
-                         border: '1px solid #ddd', 
-                         textAlign: 'left',
-                         minWidth: '150px'
-                       }}>
-                         Amount (INR) *
-                       </th>
-                       <th style={{ 
-                         padding: '0.75rem', 
-                         border: '1px solid #ddd', 
-                         textAlign: 'left',
-                         minWidth: '120px'
-                       }}>
-                         Date (DD/MM/YYYY) *
-                       </th>
-                       <th style={{ 
-                         padding: '0.75rem', 
-                         border: '1px solid #ddd', 
-                         textAlign: 'left',
-                         minWidth: '150px'
-                       }}>
-                         UTR Number *
-                       </th>
-                       <th style={{ 
-                         padding: '0.75rem', 
-                         border: '1px solid #ddd', 
-                         textAlign: 'left',
-                         minWidth: '150px'
-                       }}>
-                         Notes
-                       </th>
-                       <th style={{ 
-                         padding: '0.75rem', 
-                         border: '1px solid #ddd', 
-                         textAlign: 'center',
-                         minWidth: '100px'
-                       }}>
-                         Error
-                       </th>
-                       <th style={{ 
-                         padding: '0.75rem', 
-                         border: '1px solid #ddd', 
-                         textAlign: 'center',
-                         width: '60px'
-                       }}>
-                         Action
-                       </th>
-                     </tr>
-                   </thead>
-                   <tbody>
-                     {missingEntriesData.map((row, index) => (
-                       <tr key={index} style={{ 
-                         backgroundColor: index % 2 === 0 ? '#ffffff' : '#f9f9f9',
-                         borderBottom: '1px solid #eee'
-                       }}>
-                         <td style={{ padding: '0.5rem', border: '1px solid #ddd' }}>
-                           <input
-                             type="text"
-                             value={row.customer_email}
-                             onChange={(e) => updateMissingEntry(index, 'customer_email', e.target.value)}
-                             placeholder="customer@example.com"
-                             style={{
-                               width: '100%',
-                               padding: '0.5rem',
-                               border: '1px solid #ccc',
-                               borderRadius: '4px',
-                               fontSize: '0.9rem'
-                             }}
-                             required
-                           />
-                         </td>
-                         <td style={{ padding: '0.5rem', border: '1px solid #ddd' }}>
-                           <input
-                             type="number"
-                             value={row.amount_inr}
-                             onChange={(e) => updateMissingEntry(index, 'amount_inr', e.target.value)}
-                             step="0.01"
-                             min="0"
-                             placeholder="0.00"
-                             style={{
-                               width: '100%',
-                               padding: '0.5rem',
-                               border: '1px solid #ccc',
-                               borderRadius: '4px',
-                               fontSize: '0.9rem'
-                             }}
-                             required
-                           />
-                         </td>
-                         <td style={{ padding: '0.5rem', border: '1px solid #ddd' }}>
-                           <input
-                             type="text"
-                             value={row.date}
-                             onChange={(e) => updateMissingEntry(index, 'date', e.target.value)}
-                             placeholder="DD/MM/YYYY or DD-MMM-YY"
-                             style={{
-                               width: '100%',
-                               padding: '0.5rem',
-                               border: row.date && !validateDate(row.date) ? '1px solid #dc3545' : '1px solid #ccc',
-                               borderRadius: '4px',
-                               fontSize: '0.9rem',
-                               backgroundColor: row.date && !validateDate(row.date) ? '#fff5f5' : 'white'
-                             }}
-                             required
-                           />
-                           {row.date && !validateDate(row.date) && (
-                             <div style={{ 
-                               fontSize: '0.75rem', 
-                               color: '#dc3545', 
-                               marginTop: '0.25rem' 
-                             }}>
-                               Please enter a valid date in DD/MM/YYYY or DD-MMM-YY format
-                             </div>
-                           )}
-                         </td>
-                         <td style={{ padding: '0.5rem', border: '1px solid #ddd' }}>
-                           <input
-                             type="text"
-                             value={row.utr}
-                             onChange={(e) => updateMissingEntry(index, 'utr', e.target.value)}
-                             placeholder="UTR123456789"
-                             style={{
-                               width: '100%',
-                               padding: '0.5rem',
-                               border: '1px solid #ccc',
-                               borderRadius: '4px',
-                               fontSize: '0.9rem'
-                             }}
-                           />
-                         </td>
-                         <td style={{ padding: '0.5rem', border: '1px solid #ddd' }}>
-                           <input
-                             type="text"
-                             value={row.notes}
-                             onChange={(e) => updateMissingEntry(index, 'notes', e.target.value)}
-                             placeholder="Notes"
-                             style={{
-                               width: '100%',
-                               padding: '0.5rem',
-                               border: '1px solid #ccc',
-                               borderRadius: '4px',
-                               fontSize: '0.9rem'
-                             }}
-                           />
-                         </td>
-                         <td style={{ padding: '0.5rem', border: '1px solid #ddd', textAlign: 'center' }}>
-                           <span style={{ 
-                             fontSize: '0.75rem', 
-                             color: '#dc3545',
-                             fontWeight: 'bold'
-                           }}>
-                             {row.error}
-                           </span>
-                         </td>
-                         <td style={{ padding: '0.5rem', border: '1px solid #ddd', textAlign: 'center' }}>
-                           <button
-                             type="button"
-                             onClick={() => removeMissingEntry(index)}
-                             style={{
-                               background: '#dc3545',
-                               color: 'white',
-                               border: 'none',
-                               borderRadius: '50%',
-                               width: '24px',
-                               height: '24px',
-                               fontSize: '14px',
-                               cursor: 'pointer',
-                               display: 'flex',
-                               alignItems: 'center',
-                               justifyContent: 'center'
-                             }}
-                             title="Remove this row"
-                           >
-                             ×
-                           </button>
-                         </td>
-                       </tr>
-                     ))}
-                   </tbody>
-                 </table>
-               </div>
-             </div>
-             
-             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-               <div style={{ fontSize: '0.9rem', color: '#856404' }}>
-                 {missingEntriesData.filter(row => row.customer_email && row.amount_inr && row.amount_inr > 0 && validateDate(row.date) && row.utr && row.utr.trim()).length} valid row(s) ready to save
-               </div>
-             </div>
-             
-             <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
-                                <button 
-                   type="submit" 
-                   className="btn btn-warning" 
-                   disabled={missingEntriesLoading}
-                   style={{ padding: '0.75rem 1.5rem', fontSize: '1rem' }}
-                 >
-                   {missingEntriesLoading ? 'Saving...' : `Save ${missingEntriesData.filter(row => row.customer_email && row.amount_inr && row.amount_inr > 0 && validateDate(row.date) && row.utr && row.utr.trim()).length} Corrected Payout(s)`}
-                 </button>
-               <button 
-                 type="button" 
-                 onClick={() => {
-                   setShowMissingEntriesTable(false);
-                   setMissingEntriesData([]);
-                 }} 
-                 className="btn btn-secondary"
-                 style={{ padding: '0.75rem 1.5rem', fontSize: '1rem' }}
-               >
-                 Cancel
-               </button>
-             </div>
-           </form>
-         </div>
-       )}
-
        {showForm && (
         <div id="payout-edit-form" className="card" style={{ maxWidth: '600px', margin: '0 auto' }}>
           <h3 style={{ marginBottom: '1rem', fontSize: '1.2rem' }}>{editingPayout ? 'Edit Payout' : 'Add New Payout'}</h3>
@@ -3606,55 +2402,10 @@ function Payouts() {
         </div>
       )}
 
-      {showUploadForm && (
-        <div className="card">
-          <h3>Upload Payouts from CSV</h3>
-                     <div style={{ marginBottom: '1rem' }}>
-             <p><strong>CSV Format Requirements:</strong></p>
-             <ul style={{ marginLeft: '1rem', marginBottom: '1rem' }}>
-               <li>First row should contain headers: "Customer Email", "Amount (INR)", "Date", "UTR" (required), "Notes" (optional)</li>
-               <li>Customer Email must exist in the system (will be created automatically if not found)</li>
-               <li>Date format: DD/MM/YYYY (e.g., 01/01/2024)</li>
-               <li>Amount should be a positive number</li>
-               <li><strong>UTR is REQUIRED for payouts</strong> - entries without UTR will be shown for editing</li>
-               <li>UTR must be unique if provided</li>
-               <li>Duplicate UTRs will be automatically skipped</li>
-             </ul>
-            <button onClick={downloadSampleCSV} className="btn btn-secondary btn-sm">
-              Download Sample CSV
-            </button>
-          </div>
-          <form>
-            <div className="form-group">
-              <label htmlFor="csvFile">Select CSV File</label>
-              <input
-                type="file"
-                id="csvFile"
-                accept=".csv"
-                ref={fileInputRef}
-                onChange={handleFileUpload}
-                disabled={uploadLoading}
-              />
-            </div>
-            <div>
-              <button 
-                type="button" 
-                onClick={() => setShowUploadForm(false)} 
-                className="btn btn-secondary"
-                disabled={uploadLoading}
-              >
-                Cancel
-              </button>
-            </div>
-          </form>
-          {uploadLoading && (
-            <div style={{ marginTop: '1rem' }}>
-              <p>Uploading payouts...</p>
-            </div>
-          )}
-        </div>
-      )}
-
+      {showAllPayouts ? (
+        <PayoutsLedger embedded change={ledgerChange} />
+      ) : (
+      <>
       {/* Search Box */}
       <div style={{ marginBottom: '1rem' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1rem' }}>
@@ -4385,19 +3136,9 @@ function Payouts() {
         )}
 
       </div>
-
-      {/* Bulk Upload Editor */}
-      {showBulkEditor && (
-        <BulkUploadEditor
-          type="payouts"
-          csvData={bulkEditorData}
-          onSave={handleBulkEditorSave}
-          onCancel={handleBulkEditorCancel}
-          customers={customers}
-        />
+      </>
       )}
 
-      
     </div>
   );
 }
