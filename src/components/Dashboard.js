@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from '../supabase';
+import { fetchAll } from '../utils/fetchAll';
 import { format } from 'date-fns';
 
 function Dashboard() {
@@ -233,25 +234,13 @@ function Dashboard() {
 
   const fetchDashboardData = async () => {
     try {
-      // Fetch total payments
-      const { data: paymentsData, error: paymentsError } = await supabase
-        .from('payments')
-        .select('amount_inr');
-
-      if (paymentsError) throw paymentsError;
-
-      // Fetch total payouts
-      const { data: payoutsData, error: payoutsError } = await supabase
-        .from('payouts')
-        .select('amount_inr')
-        .limit(10000); // Increase limit to ensure we get all payouts
-
-      if (payoutsError) throw payoutsError;
-
-      // Fetch customer count
-      const { data: customersData, error: customersError } = await supabase
-        .from('customers')
-        .select('id');
+      // Every payment / payout row (a single Supabase request stops at 1,000 rows) and the
+      // exact customer count, fetched together
+      const [paymentsData, payoutsData, { count: customerCount, error: customersError }] = await Promise.all([
+        fetchAll('payments', 'id, amount_inr'),
+        fetchAll('payouts', 'id, amount_inr'),
+        supabase.from('customers').select('id', { count: 'exact', head: true }),
+      ]);
 
       if (customersError) throw customersError;
 
@@ -287,15 +276,15 @@ function Dashboard() {
       });
 
       // Calculate totals
-      const totalPayments = paymentsData.reduce((sum, payment) => sum + payment.amount_inr, 0);
-      const totalPayouts = payoutsData.reduce((sum, payout) => sum + payout.amount_inr, 0);
+      const totalPayments = paymentsData.reduce((sum, payment) => sum + (Number(payment.amount_inr) || 0), 0);
+      const totalPayouts = payoutsData.reduce((sum, payout) => sum + (Number(payout.amount_inr) || 0), 0);
       const netBalance = totalPayments - totalPayouts;
 
       setStats({
         totalPayments,
         totalPayouts,
         netBalance,
-        customerCount: customersData.length,
+        customerCount: customerCount || 0,
         totalInterBankTransfers
       });
 

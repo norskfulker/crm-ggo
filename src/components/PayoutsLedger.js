@@ -115,6 +115,7 @@ function PayoutsLedger({ embedded = false, change = null } = {}) {
   const [unrecSource, setUnrecSource] = useState('all');
   const [unrecMonth, setUnrecMonth] = useState('all');
   const [unrecSearch, setUnrecSearch] = useState('');
+  const [unrecUntaggedOnly, setUnrecUntaggedOnly] = useState(false); // hide lines that already have a customer email
   const [unrecShown, setUnrecShown] = useState(UNREC_PAGE);
   const skipBlur = useRef(false);
 
@@ -327,7 +328,7 @@ function PayoutsLedger({ embedded = false, change = null } = {}) {
   const unrecordedTransfers = useMemo(() => (unrecordedAll ? unrecordedAll.filter(isTransferDebit) : null), [unrecordedAll]);
   const sumOf = (list) => (list || []).reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
 
-  const unrecorded = useMemo(() => {
+  const unrecordedBase = useMemo(() => {
     let list = (unrecTransfersOnly ? unrecordedTransfers : unrecordedAll) || [];
     if (unrecSource !== 'all') list = list.filter(t => t.source === unrecSource);
     if (unrecMonth !== 'all') list = list.filter(t => String(t.txn_date).startsWith(unrecMonth));
@@ -348,11 +349,12 @@ function PayoutsLedger({ embedded = false, change = null } = {}) {
     () => customers.map(c => ({ email: c.email, name: nameFromEmail(c.email) })).filter(c => c.name.length >= 3),
     [customers]
   );
-  const unrecVisible = unrecorded.slice(0, unrecShown);
+  // Customer email for each line, from the bank counterparty name. With "Not tagged only" every
+  // line is checked (so tagged ones can be hidden); otherwise only the lines on screen.
   const unrecSuggest = useMemo(() => {
     const out = new Map();
     if (!showUnrec) return out;
-    unrecVisible.forEach(t => {
+    (unrecUntaggedOnly ? unrecordedBase : unrecordedBase.slice(0, unrecShown)).forEach(t => {
       let best = '';
       let bestScore = 0.8;
       customerNames.forEach(c => {
@@ -362,7 +364,13 @@ function PayoutsLedger({ embedded = false, change = null } = {}) {
       if (best) out.set(t.id, best);
     });
     return out;
-  }, [showUnrec, unrecorded, unrecShown, customerNames]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [showUnrec, unrecordedBase, unrecShown, unrecUntaggedOnly, customerNames]);
+  // "Not tagged only": leave out lines that already have a customer email
+  const unrecorded = useMemo(
+    () => (unrecUntaggedOnly ? unrecordedBase.filter(t => !unrecSuggest.has(t.id)) : unrecordedBase),
+    [unrecordedBase, unrecUntaggedOnly, unrecSuggest]
+  );
+  const unrecVisible = unrecorded.slice(0, unrecShown);
 
   const toggleUnrec = () => {
     setShowUnrec(v => !v);
@@ -795,6 +803,11 @@ function PayoutsLedger({ embedded = false, change = null } = {}) {
             <label title="Leave out card payments, ATM cash, cheques and bank charges">
               <input type="checkbox" checked={unrecTransfersOnly} onChange={e => { setUnrecTransfersOnly(e.target.checked); setUnrecShown(UNREC_PAGE); }} /> Transfers only
             </label>
+            <button type="button" className={`btn btn-sm ${unrecUntaggedOnly ? 'btn-primary' : 'btn-secondary'}`}
+              title="Show only lines with no customer email yet"
+              onClick={() => { setUnrecUntaggedOnly(v => !v); setUnrecShown(UNREC_PAGE); }}>
+              {unrecUntaggedOnly ? 'Show all' : 'Not tagged only'}
+            </button>
           </div>
           <div className="ledger-summary">
             <span><strong>{unrecorded.length.toLocaleString('en-IN')}</strong> lines</span>
